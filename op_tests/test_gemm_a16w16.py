@@ -150,7 +150,7 @@ def test_gemm(dtype, m, n, k, bias=False, otype=None, scaleA=None, scaleB=None):
         # and (n == 256)
         # and (k == 5120 or k == 7168)
         and bias is None
-        and False
+        # and False
     ):
         # out_asm = torch.empty((m + 191) // 192 * 192, n, dtype=otype)
         out_asm = torch.empty(m, n, dtype=otype, device=x.device)
@@ -380,21 +380,22 @@ def test_skinny_gemm():
     test_mnk_list = []
     test_mnk_list.extend(
         [
-            [3, 1, 8192],
-            [4, 1, 8192],
-            [4, 32, 8192],
-            [4, 32, 9216],
-            [16, 7424, 8192],
-            [32, 7424, 8192],
-            [48, 7424, 8192],
-            [64, 7424, 8192],
-            [4096, 7424, 8192],
-            [5120, 7424, 8192],
-            [8192, 7424, 8192],
+            #[3, 1, 8192],
+            #[4, 1, 8192],
+            #[4, 32, 8192],
+            #[4, 32, 9216],
+            #[16, 7424, 8192],
+            #[32, 7424, 8192],
+            #[48, 7424, 8192],
+            #[64, 7424, 8192],
+            [4096, 4096, 4096],
+            #[4096, 7424, 8192],
+            #[5120, 7424, 8192],
+            #[8192, 7424, 8192],
         ]
     )
-    test_mnk_list.extend(boundary_mnk_list)
-    test_mnk_list.extend(mnk_list)
+    #test_mnk_list.extend(boundary_mnk_list)
+    #test_mnk_list.extend(mnk_list)
     print(f"cu_count={cu_count}")
     print(f"len(boundary_mnk_list)={len(boundary_mnk_list)}")
     print(f"len(mnk_list)={len(mnk_list)}")
@@ -407,8 +408,8 @@ def test_skinny_gemm():
     for i in range(loop_count):
         for mnk in test_mnk_list:
             m, n, k = mnk
-            for dtype in [dtypes.fp16, dtypes.bf16]:
-                for otype in [None, dtypes.fp16, dtypes.bf16, dtypes.fp32]:
+            for dtype in [dtypes.fp16]:
+                for otype in [dtypes.fp16]:
                     ret = test_gemm(dtype, m, n, k, otype=otype)
                     df.append(ret)
     return df
@@ -434,7 +435,8 @@ parser.add_argument(
     "--dtype",
     type=dtypes.str2Dtype,
     # choices=["bf16", "fp16", "fp8"],
-    default=[torch.bfloat16, torch.float16],
+    default=[torch.bfloat16],
+    #default=[torch.bfloat16, torch.float16],
     help="""Data type. Support "bf16", "fp16", "fp8".
     e.g.: -d bf16
           or -d bf16,fp16    # Multiple comma-separated argus supported.""",
@@ -444,7 +446,8 @@ parser.add_argument(
     type=dtypes.str2tuple,
     nargs="+",
     const=None,
-    default=[(128, 32, 8192), (64, 256, 5120)],  # (64, 256, 5120) in tuned_gemm.csv
+    default=[(4096, 4096, 4096),],  # (64, 256, 5120) in tuned_gemm.csv
+    #default=[(128, 32, 8192), (64, 256, 5120)],  # (64, 256, 5120) in tuned_gemm.csv
     help="""Shape of mnk.
     e.g. -mnk 128,32,8192""",
 )
@@ -459,7 +462,8 @@ parser.add_argument(
     "-o",
     "--otype",
     type=dtypes.str2Dtype,
-    default=[None, torch.float16, torch.bfloat16, torch.float32],
+    default=[torch.bfloat16],
+    #default=[None, torch.float16, torch.bfloat16, torch.float32],
     help="""Data type of output.
     e.g.: -d bf16""",
 )

@@ -81,6 +81,10 @@ def gemm_a16w16(
         ),
     )
     bias=None
+    #print(f"{x.shape=}")
+    #print(f"{x.stride()=}")
+    #print(f"{w.shape=}")
+    #print(f"{w.stride()=}")
     _gemm_a16_w16_kernel[grid](
         x,
         w,

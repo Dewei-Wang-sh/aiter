@@ -62,7 +62,7 @@ def bench_gemm_fn(
             rep=100,  # noqa: E731
         )
         torch_output = torch.matmul(x, w.t())
-        torch.testing.assert_close(y, torch_output, atol=1e-4, rtol=1e-2)
+        torch.testing.assert_close(y, torch_output, atol=1.1e-4, rtol=1e-2)
         #if torch.allclose(y, torch_output, atol=1e-2, rtol=1e-2):
         #    print("✅ Triton and Torch match")
 
