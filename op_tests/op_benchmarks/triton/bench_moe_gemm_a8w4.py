@@ -151,7 +151,7 @@ def bench_mlp(
     if x_dtype == torch.float8_e4m3fn and get_arch() == "gfx942":
         x_dtype = torch.float8_e4m3fnuz
 
-    reps = 100
+    reps = 1
     x = torch.randn((batch, dim1), dtype=torch.bfloat16, device=dev)
     xg = x
     if x_dtype_str == "fp8":
@@ -178,18 +178,18 @@ def bench_mlp(
                 out_dtype=x_dtype,
                 apply_swiglu=True,
             )
-            x = moe_gemm_a8w4(
-                x,
-                w2,
-                None,
-                w2_scale,
-                static_scale,
-                None,
-                b2,
-                rdata,
-                scatter_indx=scatter_indx,
-                swizzle_mx_scale=swizzle_mx_scale2,
-            )
+            #x = moe_gemm_a8w4(
+            #    x,
+            #    w2,
+            #    None,
+            #    w2_scale,
+            #    static_scale,
+            #    None,
+            #    b2,
+            #    rdata,
+            #    scatter_indx=scatter_indx,
+            #    swizzle_mx_scale=swizzle_mx_scale2,
+            #)
         else:
             assert x_dtype_str == "mx8"
             x, _, x_scale = quantize(x, x_dtype_str)
@@ -293,13 +293,13 @@ if __name__ == "__main__":
     dim1, dim2 = args.shape
     total_experts, active_experts = args.experts
     batch_ranges_moe = [
-        (1, 2, 1),
-        (2, 5, 2),
-        (8, 18, 8),
-        (32, 65, 32),
-        (128, 257, 128),
-        (1024, 1200, 200),
-        (4096, 8200, 4096),
+        #(1, 2, 1),
+        #(2, 5, 2),
+        #(8, 18, 8),
+        #(32, 65, 32),
+        #(128, 257, 128),
+        #(1024, 1200, 200),
+        (4096, 8000, 4096),
     ]
     batch_sizes_moe = list(chain(*[range(*r) for r in batch_ranges_moe]))
     quantized_dtypes = [args.act_dtype, "mx4"]

@@ -299,6 +299,36 @@ def moe_gemm_a8w4(
     grid_m = routing_data.n_blocks(M, config["block_m"])
     grid_n = triton.cdiv(N, config["block_n"])
     grid = grid_m * grid_n * config["split_k"]
+
+    print(f"moe_gemm_a8w4 kernel config:")
+    print(f"{y.shape=}")
+    print(f"{y.stride()=}")
+    print(f"{y.dtype=}")
+    print(f"{x.shape=}")
+    print(f"{x.stride()=}")
+    print(f"{x.dtype=}")
+    if x_scales is not None:
+      print(f"{x_scales.shape=}")
+    print(f"{w.shape=}")
+    print(f"{w.stride()=}")
+    print(f"{w.dtype=}")
+    if w_scales is not None:
+      print(f"{w_scales.shape=}")
+      print(f"{w_scales.stride()=}")
+    print(f"{config=}")
+    print(f"{x_static_scale=}")
+    print(f"{quant_static_scale=}")
+    print(f"{bias=}")
+    print(f"{stride_bias=}")
+    print(f"{gammas=}")
+    print(f"{gather_indx=}")
+    print(f"{apply_swiglu_matmul=}")
+    print(f"{alpha=}")
+    print(f"{limit=}")
+    print(f"{reduction_n_matmul=}")
+    print(f"{routing_data.n_expts_act=}")
+    print(f"{swizzle_mx_scale=}")
+
     # launch kernel
     _moe_gemm_a8w4[(grid,)](
         y,
@@ -352,6 +382,7 @@ def moe_gemm_a8w4(
         num_stages=config["num_stages"],
         UPCAST_INDICES=should_upcast_indices(x, w, y),
         waves_per_eu=config["waves_per_eu"],
+        #waves_per_eu=2,
         matrix_instr_nonkdim=config["matrix_instr_nonkdim"],
         kpack=config["kpack"],
     )
