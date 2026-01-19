@@ -130,7 +130,8 @@ def swizzle_scales(data):
     N = block_shape[-1]
     data = data.transpose(-1, -2)
     data = data.view(-1, N // NON_K_PRESHUFFLE_BLOCK_SIZE, 2, 16, SCALE_K // 8, 2, 4, 1)
-    data = data.permute(0, 1, 4, 6, 3, 5, 2, 7).contiguous()
+    #data = data.permute(0, 1, 4, 6, 3, 5, 2, 7).contiguous()
+    data = data.permute(0, 1, 4, 6, 3, 2, 5, 7).contiguous()
     E = block_shape[0]
     data = data.reshape(E, N // 32, SCALE_K * 32)
     return data.transpose(-1, -2)

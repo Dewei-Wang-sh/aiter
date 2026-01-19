@@ -90,7 +90,8 @@ def unswizzle_mx_scale_cdna4(
     N_PRESHUFFLE_FACTOR: tl.constexpr = 32,
 ):
     x = x.reshape(BLOCK_N // N_PRESHUFFLE_FACTOR, MX_SCALE_BLOCK_K // 8, 4, 16, 2, 2, 1)
-    x = x.permute(0, 5, 3, 1, 4, 2, 6)
+    #x = x.permute(0, 5, 3, 1, 4, 2, 6)
+    x = x.permute(0, 4, 3, 1, 5, 2, 6)
     x = x.reshape(BLOCK_N, MX_SCALE_BLOCK_K)
     return x
 
