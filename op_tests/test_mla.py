@@ -225,8 +225,10 @@ def test_mla(
 
     us_aiter = None
     if (
-        dtype == torch.bfloat16 and kvtype == torch.bfloat16
-    ) and batch_size * ctx_lens * nhead < 256 * 8192 * 16:
+        (dtype == torch.bfloat16 and kvtype == torch.bfloat16)
+        and batch_size * ctx_lens * nhead < 256 * 8192 * 16
+        and ctx_lens <= 32768
+    ):
         us_aiter = test_normal_prefill()
         ret["prefill:ck_192"] = us_aiter
 
@@ -313,8 +315,10 @@ def test_mla(
 
     us_asm = None
     if (
-        dtype == torch.bfloat16 and kvtype == torch.bfloat16 and nhead in [16, 128]
-    ) and batch_size * ctx_lens * nhead < 32 * 8192 * 16:
+        (dtype == torch.bfloat16 and kvtype == torch.bfloat16 and nhead in [16, 128])
+        and batch_size * ctx_lens * nhead < 32 * 8192 * 16
+        and ctx_lens <= 32768
+    ):
         us_asm = test_absorb_prefill()
         ret["prefill:asm_576"] = us_asm
 
@@ -515,8 +519,12 @@ def test_mla(
         q_nope = q[:, :, :v_head_dim].view(batch_size, nhead, v_head_dim)
         q_pe = q[:, :, v_head_dim:].view(batch_size, nhead, qk_head_dim - v_head_dim)
 
-        # KV: flat [N, 576] buffer; same layout as Gluon test
+        # KV: flat [N, 576] buffer
         kv_c = kv_buffer.view(-1, qk_head_dim)
+        kv_scale_val = 1.0
+        if kvtype == dtypes.fp8:
+            kv_c = kv_c.to(dtypes.fp8)
+            kv_scale_val = 1.0
 
         if not varlen:
             page_table = kv_indices[:total_kv].view(batch_size, ctx_lens)
@@ -536,8 +544,8 @@ def test_mla(
             page_table,
             seq_info,
             sm_scale,
-            num_kv_splits=1,
             use_2d_view=use_2d_view,
+            kv_scale=kv_scale_val,
         )
 
         err = checkAllclose(
@@ -596,13 +604,13 @@ def test_mla(
             ret["decode:gluon_err"] = err_gluon
     ret["decode:gluon_576"] = us_gluon_decode
 
-    # Triton MLA decode test (bf16 only, nhead multiple of 16, decode_qlen=1,
-    # head_dim_ckv=512, head_dim_kpe=64, page_size=1)
+    # Triton MLA decode test (bf16 Q, bf16/fp8 KV, nhead multiple of 4,
+    # decode_qlen=1, head_dim_ckv=512, head_dim_kpe=64, page_size=1)
     us_triton_decode = 1e12
     if (
         dtype == torch.bfloat16
-        and kvtype == torch.bfloat16
-        and nhead % 16 == 0
+        and kvtype in (torch.bfloat16, dtypes.fp8)
+        and nhead % 4 == 0
         and decode_qlen == 1
         and v_head_dim == 512
         and (qk_head_dim - v_head_dim) == 64
@@ -719,10 +727,10 @@ parser.add_argument(
     "-n",
     "--nhead",
     type=dtypes.str2tuple,
-    choices=[(16, 1), (16, 2), (16, 4), (64, 1), (128, 1), (128, 2), (128, 4)],
+    choices=[(4, 1), (16, 1), (16, 2), (16, 4), (64, 1), (128, 1), (128, 2), (128, 4)],
     nargs="*",
     const=None,
-    default=[(16, 1), (16, 2), (16, 4), (128, 1), (128, 2)],
+    default=[(4, 1), (16, 1), (16, 2), (16, 4), (128, 1), (128, 2)],
     help="""Number of nhead and decode_qlen.
     e.g.: -n 16,1""",
 )

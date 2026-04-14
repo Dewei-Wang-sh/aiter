@@ -2,9 +2,12 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 # MLA Triton kernel is from: https://github.com/deepseek-ai/FlashMLA/blob/main/benchmark/bench_flash_mla.py
-# Adapted below 2 places for aiter:
-# KV layout (flat [N, dim] buffer + KV_PE_OFFSET),
-# USE_2D_VIEW page table.
+# Adapted for aiter:
+# - KV layout (flat [N, dim] buffer + KV_PE_OFFSET)
+# - USE_2D_VIEW page table
+# Adapted from kimi2.5 helios
+# - kv_scale for fp8 KV support
+# - Two launch modes: Mode A (large batch/nhead) and Mode B (small batch/nhead, split-K)
 
 import torch
 import triton
@@ -21,6 +24,7 @@ def _mla_attn_kernel(
     B_seq_len,
     O,
     sm_scale,
+    kv_scale,
     stride_q_nope_bs,
     stride_q_nope_h,
     stride_q_pe_bs,
@@ -97,29 +101,31 @@ def _mla_attn_kernel(
         offs_k_c = kv_loc[None, :] * stride_kv_c_bs + offs_d_ckv[:, None]
         k_c = tl.load(
             Kv_c_cache + offs_k_c, mask=offs_n[None, :] < split_kv_end, other=0.0
-        )
+        ).to(q_nope.dtype)
 
-        qk = tl.dot(q_nope, k_c.to(q_nope.dtype))
+        qk = tl.dot(q_nope, k_c)
 
         offs_k_pe = (
             kv_loc[None, :] * stride_k_pe_bs + offs_d_kpe[:, None] + KV_PE_OFFSET
         )
         k_pe = tl.load(
             K_pe_cache + offs_k_pe, mask=offs_n[None, :] < split_kv_end, other=0.0
-        )
+        ).to(q_pe.dtype)
 
-        qk += tl.dot(q_pe, k_pe.to(q_pe.dtype))
+        qk += tl.dot(q_pe, k_pe)
         qk *= sm_scale
 
         qk = tl.where(offs_n[None, :] < split_kv_end, qk, float("-inf"))
 
         v_c = tl.trans(k_c)
 
+        # NOTE: uses exp2-based softmax (exp2(x * log2e)) for
+        # potentially better HW utilization. Keeping exp() for now
         n_e_max = tl.maximum(tl.max(qk, 1), e_max)
         re_scale = tl.exp(e_max - n_e_max)
         p = tl.exp(qk - n_e_max[:, None])
         acc *= re_scale[:, None]
-        acc += tl.dot(p.to(v_c.dtype), v_c)
+        acc += tl.dot(p.to(v_c.dtype), v_c) * kv_scale
 
         e_sum = e_sum * re_scale + tl.sum(p, 1)
         e_max = n_e_max
@@ -208,9 +214,10 @@ def mla_decode_triton(
     sm_scale,
     k_pe=None,
     kv_pe_offset=512,
-    num_kv_splits=1,
+    num_kv_splits=None,
     page_size=1,
     use_2d_view=True,
+    kv_scale=1.0,
 ):
     if k_pe is None:
         k_pe = kv_c
@@ -218,8 +225,29 @@ def mla_decode_triton(
     batch_size, nhead, head_dim_ckv = q_nope.shape
     head_dim_kpe = q_pe.shape[-1]
 
-    BLOCK_H = 64
-    BLOCK_N = 32
+    # Two launch modes based on batch_size and nhead:
+    # Mode A: large batch x large nhead — parallelize over batch and heads
+    # Mode B: small batch x small nhead — parallelize over KV splits
+    if batch_size <= 1 and nhead <= 16:
+        # Mode B: all heads in one tile, split-K parallel
+        BLOCK_H = triton.next_power_of_2(nhead)
+        # fp8 KV (1 byte) uses half the shared memory of bf16 (2 bytes),
+        # so BLOCK_N=128 fits even at BLOCK_H=16; bf16 needs BLOCK_N=64
+        # when BLOCK_H > 4 to stay within shared memory limits.
+        kv_is_fp8 = kv_c.element_size() == 1
+        BLOCK_N = 128 if (BLOCK_H <= 4 or kv_is_fp8) else 64
+        if num_kv_splits is None:
+            if use_2d_view:
+                total_kv = int(seq_info.sum().item())
+            else:
+                total_kv = int(seq_info[-1].item()) - int(seq_info[0].item())
+            num_kv_splits = max(1, min(256, total_kv // BLOCK_N))
+    else:
+        # Mode A: batch x head parallel
+        BLOCK_H = 64
+        BLOCK_N = 32
+        if num_kv_splits is None:
+            num_kv_splits = 1
 
     attn_logits = torch.empty(
         (batch_size, nhead, num_kv_splits, head_dim_ckv + 1),
@@ -243,6 +271,7 @@ def mla_decode_triton(
         seq_info,
         attn_logits,
         sm_scale,
+        kv_scale,
         q_nope.stride(0),
         q_nope.stride(1),
         q_pe.stride(0),
