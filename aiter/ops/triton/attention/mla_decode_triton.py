@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-# MLA Triton kernel is from: https://github.com/monellz/vllm/commit/feebaa7c063be6bfb590a876741aeef1c5f58cf8#diff-7b2e1c9032522f7266051b9887246a65753871dfb3625a258fee40109fe6e87a
-# via /home/dewwang/FlashMLA/benchmark/bench_flash_mla.orig.py
+# MLA Triton kernel is from: https://github.com/deepseek-ai/FlashMLA/blob/main/benchmark/bench_flash_mla.py
+# Adapted below 2 places for aiter:
+# KV layout (flat [N, dim] buffer + KV_PE_OFFSET),
+# USE_2D_VIEW page table.
 
+import torch
 import triton
 import triton.language as tl
 
@@ -34,12 +37,21 @@ def _mla_attn_kernel(
     PAGE_SIZE: tl.constexpr,
     HEAD_DIM_CKV: tl.constexpr,
     HEAD_DIM_KPE: tl.constexpr,
+    KV_PE_OFFSET: tl.constexpr,
+    USE_2D_VIEW: tl.constexpr,
 ):
-    cur_batch = tl.program_id(1)
-    cur_head_id = tl.program_id(0)
+    cur_batch = tl.program_id(0)
+    cur_head_id = tl.program_id(1)
     split_kv_id = tl.program_id(2)
 
-    cur_batch_seq_len = tl.load(B_seq_len + cur_batch)
+    # USE_2D_VIEW=True: block_table[batch, max_seqlen], cache_seqlens[batch]
+    # USE_2D_VIEW=False: kv_indices[total_kv], kv_indptr[batch+1]
+    if USE_2D_VIEW:
+        batch_page_start = stride_req_to_tokens_bs * cur_batch
+        cur_batch_seq_len = tl.load(B_seq_len + cur_batch)
+    else:
+        batch_page_start = tl.load(B_seq_len + cur_batch)
+        cur_batch_seq_len = tl.load(B_seq_len + cur_batch + 1) - batch_page_start
 
     offs_d_ckv = tl.arange(0, HEAD_DIM_CKV)
     cur_head = cur_head_id * BLOCK_H + tl.arange(0, BLOCK_H)
@@ -68,12 +80,20 @@ def _mla_attn_kernel(
 
     for start_n in range(split_kv_start, split_kv_end, BLOCK_N):
         offs_n = start_n + tl.arange(0, BLOCK_N)
-        kv_page_number = tl.load(
-            Req_to_tokens + stride_req_to_tokens_bs * cur_batch + offs_n // PAGE_SIZE,
-            mask=offs_n < split_kv_end,
-            other=0,
-        )
-        kv_loc = kv_page_number * PAGE_SIZE + offs_n % PAGE_SIZE
+        if USE_2D_VIEW:
+            kv_page_number = tl.load(
+                Req_to_tokens + batch_page_start + offs_n // PAGE_SIZE,
+                mask=offs_n < split_kv_end,
+                other=0,
+            )
+            kv_loc = kv_page_number * PAGE_SIZE + offs_n % PAGE_SIZE
+        else:
+            kv_loc = tl.load(
+                Req_to_tokens + batch_page_start + offs_n,
+                mask=offs_n < split_kv_end,
+                other=0,
+            )
+
         offs_k_c = kv_loc[None, :] * stride_kv_c_bs + offs_d_ckv[:, None]
         k_c = tl.load(
             Kv_c_cache + offs_k_c, mask=offs_n[None, :] < split_kv_end, other=0.0
@@ -81,7 +101,9 @@ def _mla_attn_kernel(
 
         qk = tl.dot(q_nope, k_c.to(q_nope.dtype))
 
-        offs_k_pe = kv_loc[None, :] * stride_k_pe_bs + offs_d_kpe[:, None]
+        offs_k_pe = (
+            kv_loc[None, :] * stride_k_pe_bs + offs_d_kpe[:, None] + KV_PE_OFFSET
+        )
         k_pe = tl.load(
             K_pe_cache + offs_k_pe, mask=offs_n[None, :] < split_kv_end, other=0.0
         )
@@ -129,10 +151,17 @@ def _mla_softmax_reducev_kernel(
     stride_o_h,
     NUM_KV_SPLITS: tl.constexpr,
     HEAD_DIM_CKV: tl.constexpr,
+    USE_2D_VIEW: tl.constexpr,
 ):
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
-    cur_batch_seq_len = tl.load(B_seq_len + cur_batch)
+
+    if USE_2D_VIEW:
+        cur_batch_seq_len = tl.load(B_seq_len + cur_batch)
+    else:
+        cur_batch_seq_len = tl.load(B_seq_len + cur_batch + 1) - tl.load(
+            B_seq_len + cur_batch
+        )
 
     offs_d_ckv = tl.arange(0, HEAD_DIM_CKV)
 
@@ -167,46 +196,60 @@ def _mla_softmax_reducev_kernel(
     )
 
 
-def _mla_attn(
-    q_nope,
-    q_pe,
-    kv_c_cache,
-    k_pe_cache,
-    attn_logits,
-    req_to_tokens,
-    b_seq_len,
-    num_kv_splits,
+def mla_decode_triton(
+    q_nope,  # [batch, nhead, kv_lora_rank]
+    q_pe,  # [batch, nhead, qk_rope_head_dim]
+    # Shared: kv_c=[N, kv_lora_rank+qk_rope_head_dim], k_pe=None,              kv_pe_offset=kv_lora_rank
+    # Split:  kv_c=[N, kv_lora_rank],                k_pe=[N,qk_rope_head_dim], kv_pe_offset=0
+    kv_c,
+    o,  # [batch, nhead, kv_lora_rank] output buffer
+    page_table,  # 2D: block_table [batch, max_seqlen] | 1D: kv_indices [total_kv]
+    seq_info,  # 2D: cache_seqlens [batch]           | 1D: kv_indptr [batch+1]
     sm_scale,
-    page_size,
+    k_pe=None,
+    kv_pe_offset=512,
+    num_kv_splits=1,
+    page_size=1,
+    use_2d_view=True,
 ):
-    batch_size, head_num = q_nope.shape[0], q_nope.shape[1]
-    head_dim_ckv = q_nope.shape[-1]
+    if k_pe is None:
+        k_pe = kv_c
+
+    batch_size, nhead, head_dim_ckv = q_nope.shape
     head_dim_kpe = q_pe.shape[-1]
 
-    BLOCK_H = 16
-    BLOCK_N = 64
+    BLOCK_H = 64
+    BLOCK_N = 32
+
+    attn_logits = torch.empty(
+        (batch_size, nhead, num_kv_splits, head_dim_ckv + 1),
+        dtype=torch.float32,
+        device=q_nope.device,
+    )
+
     grid = (
-        triton.cdiv(head_num, BLOCK_H),
         batch_size,
+        triton.cdiv(nhead, BLOCK_H),
         num_kv_splits,
     )
+    stride_page_bs = page_table.stride(0) if use_2d_view else 0
+
     _mla_attn_kernel[grid](
         q_nope,
         q_pe,
-        kv_c_cache,
-        k_pe_cache,
-        req_to_tokens,
-        b_seq_len,
+        kv_c,
+        k_pe,
+        page_table,
+        seq_info,
         attn_logits,
         sm_scale,
-        # stride
         q_nope.stride(0),
         q_nope.stride(1),
         q_pe.stride(0),
         q_pe.stride(1),
-        kv_c_cache.stride(-2),
-        k_pe_cache.stride(-2),
-        req_to_tokens.stride(0),
+        kv_c.stride(-2),
+        k_pe.stride(-2),
+        stride_page_bs,
         attn_logits.stride(0),
         attn_logits.stride(1),
         attn_logits.stride(2),
@@ -216,62 +259,24 @@ def _mla_attn(
         PAGE_SIZE=page_size,
         HEAD_DIM_CKV=head_dim_ckv,
         HEAD_DIM_KPE=head_dim_kpe,
+        KV_PE_OFFSET=kv_pe_offset,
+        USE_2D_VIEW=use_2d_view,
     )
 
-
-def _mla_softmax_reducev(
-    logits,
-    o,
-    b_seq_len,
-    num_kv_splits,
-):
-    batch_size, head_num, head_dim_ckv = o.shape[0], o.shape[1], o.shape[2]
-    grid = (batch_size, head_num)
-    _mla_softmax_reducev_kernel[grid](
-        logits,
-        b_seq_len,
+    grid_reduce = (batch_size, nhead)
+    _mla_softmax_reducev_kernel[grid_reduce](
+        attn_logits,
+        seq_info,
         o,
-        logits.stride(0),
-        logits.stride(1),
-        logits.stride(2),
+        attn_logits.stride(0),
+        attn_logits.stride(1),
+        attn_logits.stride(2),
         o.stride(0),
         o.stride(1),
         NUM_KV_SPLITS=num_kv_splits,
         HEAD_DIM_CKV=head_dim_ckv,
+        USE_2D_VIEW=use_2d_view,
         num_warps=4,
         num_stages=2,
     )
-
-
-def mla_decode_triton(
-    q_nope,
-    q_pe,
-    kv_c_cache,
-    k_pe_cache,
-    o,
-    req_to_tokens,
-    b_seq_len,
-    attn_logits,
-    num_kv_splits,
-    sm_scale,
-    page_size,
-):
-    assert num_kv_splits == attn_logits.shape[2]
-    _mla_attn(
-        q_nope,
-        q_pe,
-        kv_c_cache,
-        k_pe_cache,
-        attn_logits,
-        req_to_tokens,
-        b_seq_len,
-        num_kv_splits,
-        sm_scale,
-        page_size,
-    )
-    _mla_softmax_reducev(
-        attn_logits,
-        o,
-        b_seq_len,
-        num_kv_splits,
-    )
+    return o, None
