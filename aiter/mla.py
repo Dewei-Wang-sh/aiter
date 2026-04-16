@@ -4,6 +4,7 @@
 # user interface
 
 import functools
+import math
 from typing import Optional
 import torch
 import triton
@@ -14,6 +15,32 @@ from aiter import dtypes
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 
 import os
+
+_MLA_STAGE1_MODE = os.getenv("VLLM_AITER_MLA_STAGE1_MODE", "asm").strip().lower()
+_MLA_STAGE2_MODE = os.getenv("VLLM_AITER_MLA_STAGE2_MODE", "triton").strip().lower()
+_MLA_STAGE1_MFMA_MIN_TOKENS = max(
+    1, int(os.getenv("VLLM_AITER_MLA_STAGE1_MFMA_MIN_TOKENS", "65536"))
+)
+_MLA_STAGE1_MFMA_TARGET_TOKENS = max(
+    1024, int(os.getenv("VLLM_AITER_MLA_STAGE1_MFMA_TARGET_TOKENS", "8192"))
+)
+_MLA_STAGE1_MFMA_BLOCK_N = max(
+    64, int(os.getenv("VLLM_AITER_MLA_STAGE1_MFMA_BLOCK_N", "128"))
+)
+_MLA_STAGE1_MFMA_BLOCK_K = 32
+_MLA_STAGE1_MFMA_HEADS = int(os.getenv("VLLM_AITER_MLA_STAGE1_MFMA_HEADS", "4"))
+_MLA_STAGE1_MFMA_BLOCK_V = 128
+
+_LOG2E = math.log2(math.e)
+_LN2 = math.log(2.0)
+_MLA_STAGE1_MFMA_LOGGED = False
+
+
+def _reinterpret_fp8_rows(kv_buffer: torch.Tensor) -> torch.Tensor:
+    """Views packed MLA KV rows as FP8 rows without changing storage."""
+    if kv_buffer.dtype == torch.uint8:
+        kv_buffer = kv_buffer.view(dtypes.fp8)
+    return kv_buffer.view(kv_buffer.shape[0], kv_buffer.shape[-1])
 
 
 @triton.jit
@@ -105,6 +132,339 @@ def _fwd_kernel_stage2_asm(
                 )
 
 
+@triton.jit
+def _mla_head4_mfma_fused_kernel(
+    q_nope_ptr,  # [NUM_HEADS, v_head_dim]  e.g. [4, 512]
+    q_pe_ptr,  # [NUM_HEADS, pe_dim]      e.g. [4, 64]
+    kv_ptr,  # [total_tokens, full_dim]  e.g. [N, 576]
+    kv_indices_ptr,  # [total_kv]
+    split_ptr_ptr,  # [num_kv_splits + 1]
+    numer_ptr,  # [num_kv_splits, NUM_HEADS, v_head_dim]
+    meta_ptr,  # [num_kv_splits, NUM_HEADS, 2]
+    stride_qn_h,
+    stride_qn_d,
+    stride_qp_h,
+    stride_qp_d,
+    stride_kv_row,
+    stride_kv_d,
+    stride_numer_s,
+    stride_numer_h,
+    stride_numer_v,
+    stride_meta_s,
+    stride_meta_h,
+    v_head_dim: tl.constexpr,  # 512
+    pe_dim: tl.constexpr,  # 64
+    scale,
+    kv_scale,
+    BLOCK_N: tl.constexpr,  # 64 or 128
+    NUM_HEADS: tl.constexpr,  # 4
+):
+    """Fused stage-1 MLA decode kernel for TP8 head-4 path.
+
+    Each workgroup processes one KV split. Iterates over BLOCK_N tiles,
+    computing QK scores (nope + pe), online softmax, and weighted-V
+    accumulation in a single pass — no intermediate score buffer.
+
+    QK is decomposed into nope and pe components:
+      scores = q_nope[H, 512] @ kv_nope.T[512, N] + q_pe[H, 64] @ kv_pe.T[64, N]
+    V reuses kv_nope directly:
+      numer += weights[H, N] @ kv_nope[N, 512]
+    """
+    log2e: tl.constexpr = 1.4426950408889634
+
+    pid_split = tl.program_id(0)
+
+    split_start = tl.load(split_ptr_ptr + pid_split)
+    split_end = tl.load(split_ptr_ptr + pid_split + 1)
+    split_len = split_end - split_start
+
+    offs_h = tl.arange(0, NUM_HEADS)
+    offs_nope = tl.arange(0, v_head_dim)  # [0..511]
+    offs_pe = tl.arange(0, pe_dim)  # [0..63]
+
+    stride_qn_h_i64 = tl.full((), stride_qn_h, tl.int64)
+    stride_qn_d_i64 = tl.full((), stride_qn_d, tl.int64)
+    stride_qp_h_i64 = tl.full((), stride_qp_h, tl.int64)
+    stride_qp_d_i64 = tl.full((), stride_qp_d, tl.int64)
+    stride_kv_row_i64 = tl.full((), stride_kv_row, tl.int64)
+    stride_kv_d_i64 = tl.full((), stride_kv_d, tl.int64)
+
+    # Load Q once (shared across all tiles in this split)
+    q_nope = tl.load(
+        q_nope_ptr
+        + offs_h[:, None].to(tl.int64) * stride_qn_h_i64
+        + offs_nope[None, :].to(tl.int64) * stride_qn_d_i64,
+    ).to(
+        tl.bfloat16
+    )  # [NUM_HEADS, 512]
+
+    q_pe = tl.load(
+        q_pe_ptr
+        + offs_h[:, None].to(tl.int64) * stride_qp_h_i64
+        + offs_pe[None, :].to(tl.int64) * stride_qp_d_i64,
+    ).to(
+        tl.bfloat16
+    )  # [NUM_HEADS, 64]
+
+    # Running accumulators
+    run_max = tl.full((NUM_HEADS,), -float("inf"), dtype=tl.float32)
+    run_denom = tl.zeros((NUM_HEADS,), dtype=tl.float32)
+    run_numer = tl.zeros((NUM_HEADS, v_head_dim), dtype=tl.float32)
+
+    for n0 in range(0, split_len, BLOCK_N):
+        offs_n = n0 + tl.arange(0, BLOCK_N)
+        token_mask = offs_n < split_len
+
+        # Gather token indices for this tile
+        token_indices = tl.load(
+            kv_indices_ptr + split_start + offs_n,
+            mask=token_mask,
+            other=0,
+        ).to(tl.int64)
+
+        # Load kv_nope [BLOCK_N, 512] — serves as both K_nope and V
+        kv_nope = tl.load(
+            kv_ptr
+            + token_indices[:, None] * stride_kv_row_i64
+            + offs_nope[None, :].to(tl.int64) * stride_kv_d_i64,
+            mask=token_mask[:, None],
+            other=0.0,
+        ).to(tl.bfloat16)
+
+        # Load kv_pe [BLOCK_N, 64]
+        kv_pe = tl.load(
+            kv_ptr
+            + token_indices[:, None] * stride_kv_row_i64
+            + (v_head_dim + offs_pe[None, :]).to(tl.int64) * stride_kv_d_i64,
+            mask=token_mask[:, None],
+            other=0.0,
+        ).to(tl.bfloat16)
+
+        # QK scores: q_nope @ kv_nope.T + q_pe @ kv_pe.T  → [NUM_HEADS, BLOCK_N]
+        scores = tl.dot(q_nope, tl.trans(kv_nope)) + tl.dot(q_pe, tl.trans(kv_pe))
+        scores = scores * scale
+        scores = tl.where(token_mask[None, :], scores, -float("inf"))
+
+        # Online softmax
+        tile_max = tl.max(scores, axis=1)  # [NUM_HEADS]
+        next_max = tl.maximum(run_max, tile_max)
+        old_scale = tl.exp2((run_max - next_max) * log2e)
+        weights = tl.exp2((scores - next_max[:, None]) * log2e)
+        weights = tl.where(token_mask[None, :], weights, 0.0)
+
+        # V accumulation: weights @ kv_nope → [NUM_HEADS, 512]
+        weighted_v = tl.dot(weights.to(tl.bfloat16), kv_nope)
+        run_numer = (
+            run_numer * old_scale[:, None] + weighted_v.to(tl.float32) * kv_scale
+        )
+        run_denom = run_denom * old_scale + tl.sum(weights, axis=1)
+        run_max = next_max
+
+    # Store output
+    pid_split_i64 = tl.full((), pid_split, tl.int64)
+    stride_numer_s_i64 = tl.full((), stride_numer_s, tl.int64)
+    stride_numer_h_i64 = tl.full((), stride_numer_h, tl.int64)
+    stride_numer_v_i64 = tl.full((), stride_numer_v, tl.int64)
+    stride_meta_s_i64 = tl.full((), stride_meta_s, tl.int64)
+    stride_meta_h_i64 = tl.full((), stride_meta_h, tl.int64)
+
+    tl.store(
+        numer_ptr
+        + pid_split_i64 * stride_numer_s_i64
+        + offs_h[:, None].to(tl.int64) * stride_numer_h_i64
+        + offs_nope[None, :].to(tl.int64) * stride_numer_v_i64,
+        run_numer,
+    )
+    meta_offs = (
+        meta_ptr
+        + pid_split_i64 * stride_meta_s_i64
+        + offs_h.to(tl.int64) * stride_meta_h_i64
+    )
+    tl.store(meta_offs, run_max)
+    tl.store(meta_offs + 1, run_denom)
+
+
+@triton.jit
+def _fwd_kernel_stage2_lazy_meta(
+    Mid_O,
+    Mid_lse,
+    O,
+    qo_indptr,
+    kv_indptr,
+    num_kv_splits_indptr,
+    stride_logits_b: tl.int64,
+    stride_logits_h: tl.int64,
+    stride_logits_s: tl.int64,
+    stride_meta_b: tl.int64,
+    stride_meta_h: tl.int64,
+    stride_meta_s: tl.int64,
+    stride_obs: tl.int64,
+    stride_oh: tl.int64,
+    BATCH_NUM: tl.constexpr,
+    BLOCK_DV: tl.constexpr,
+    Lv: tl.constexpr,
+    mgc: tl.constexpr,
+):
+    """Stage-2 cross-split reducer for lazy (max, denom) metadata format.
+
+    Unlike the upstream _fwd_kernel_stage2_asm which reads a single LSE
+    scalar, this kernel reads (split_max, split_denom) pairs and uses
+    exp2-based numerically stable merge.
+    """
+    log2e = 1.4426950408889634
+    cur_batch = tl.program_id(0)
+    cur_head = tl.program_id(1)
+    cur_qo_start = tl.load(qo_indptr + cur_batch)
+    cur_qo_end = tl.load(qo_indptr + cur_batch + 1)
+    cur_split_start = tl.load(num_kv_splits_indptr + cur_batch)
+    cur_split_end = tl.load(num_kv_splits_indptr + cur_batch + 1)
+    cur_kv_seq_len = tl.load(kv_indptr + cur_batch + 1) - tl.load(kv_indptr + cur_batch)
+
+    offs_d = tl.arange(0, BLOCK_DV)
+    mask_d = offs_d < Lv
+
+    offs_meta = cur_qo_start * stride_meta_b + cur_head * stride_meta_h
+    offs_logits = cur_qo_start * stride_logits_b + cur_head * stride_logits_h + offs_d
+    num_valid_kv_splits = tl.minimum(
+        cur_split_end - cur_split_start, tl.cdiv(cur_kv_seq_len, mgc)
+    )
+
+    for cur_qo in range(cur_qo_start, cur_qo_end):
+        e_sum = 0.0
+        e_max = -float("inf")
+        acc = tl.zeros((BLOCK_DV,), dtype=tl.float32)
+        for split_kv_id in range(0, num_valid_kv_splits):
+            tv = tl.load(
+                Mid_O + offs_logits + split_kv_id * stride_logits_s,
+                mask=mask_d,
+                other=0.0,
+            )
+            split_meta_base = Mid_lse + offs_meta + split_kv_id * stride_meta_s
+            split_max = tl.load(split_meta_base + 0)
+            split_denom = tl.load(split_meta_base + 1)
+            n_e_max = tl.maximum(split_max, e_max)
+
+            old_scale = tl.exp2((e_max - n_e_max) * log2e)
+            acc *= old_scale
+            split_scale = tl.exp2((split_max - n_e_max) * log2e)
+            acc += split_scale * tv
+
+            e_sum = e_sum * old_scale + split_scale * split_denom
+            e_max = n_e_max
+        offs_meta += stride_meta_b
+        offs_logits += stride_logits_b
+        tl.store(
+            O + cur_qo * stride_obs + cur_head * stride_oh + offs_d,
+            acc / e_sum,
+            mask=mask_d,
+        )
+
+
+def _mla_stage1_head4_mfma(
+    *,
+    q: torch.Tensor,
+    kv_buffer: torch.Tensor,
+    logits: torch.Tensor,
+    attn_lse: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_indices: torch.Tensor,
+    num_kv_splits: int,
+    sm_scale: float,
+    kv_scale: torch.Tensor | None,
+    v_head_dim: int,
+) -> None:
+    """Runs the fused MFMA stage-1 path for TP8 local-head4 decode."""
+
+    total_kv = int(kv_indptr[-1].item() - kv_indptr[0].item())
+    pe_dim = int(q.shape[2]) - v_head_dim  # 576 - 512 = 64
+
+    # Build split pointers: evenly divide total_kv into num_kv_splits
+    split_ptr = torch.linspace(
+        0,
+        total_kv,
+        steps=num_kv_splits + 1,
+        device=q.device,
+        dtype=torch.int32,
+    )
+    split_ptr[0] = 0
+    split_ptr[-1] = total_kv
+
+    kv_rows = _reinterpret_fp8_rows(kv_buffer)
+    kv_scale_val = float(kv_scale.item() if kv_scale is not None else 1.0)
+
+    # Split Q [1, nhead, full_dim] into q_nope [nhead, v_head_dim] and q_pe [nhead, pe_dim]
+    q_heads = q.view(q.shape[1], q.shape[2]).contiguous()  # [4, 576]
+    q_nope = q_heads[:, :v_head_dim].contiguous()  # [4, 512]
+    q_pe = q_heads[:, v_head_dim:].contiguous()  # [4, 64]
+
+    # Output buffers for fused kernel
+    numer = torch.zeros(
+        (num_kv_splits, _MLA_STAGE1_MFMA_HEADS, v_head_dim),
+        dtype=torch.float32,
+        device=q.device,
+    )
+    meta = torch.zeros(
+        (num_kv_splits, _MLA_STAGE1_MFMA_HEADS, 2),
+        dtype=torch.float32,
+        device=q.device,
+    )
+
+    grid = (num_kv_splits,)
+    _mla_head4_mfma_fused_kernel[grid](
+        q_nope,
+        q_pe,
+        kv_rows,
+        kv_indices,
+        split_ptr,
+        numer,
+        meta,
+        q_nope.stride(0),
+        q_nope.stride(1),
+        q_pe.stride(0),
+        q_pe.stride(1),
+        kv_rows.stride(0),
+        kv_rows.stride(1),
+        numer.stride(0),
+        numer.stride(1),
+        numer.stride(2),
+        meta.stride(0),
+        meta.stride(1),
+        v_head_dim=v_head_dim,
+        pe_dim=pe_dim,
+        scale=float(sm_scale),
+        kv_scale=kv_scale_val,
+        BLOCK_N=_MLA_STAGE1_MFMA_BLOCK_N,
+        NUM_HEADS=_MLA_STAGE1_MFMA_HEADS,
+        num_warps=4,
+        num_stages=2,
+    )
+
+    # Copy into logits/attn_lse expected by caller: [total_s, splits, H, Dv] / [total_s, splits, H, 2]
+    logits[0, :, :, :] = numer
+    attn_lse[0, :, :, :] = meta
+
+
+def _mla_stage2_reduce_torch_ref(
+    logits: torch.Tensor,
+    attn_lse: torch.Tensor,
+    out: torch.Tensor,
+    final_lse: torch.Tensor,
+) -> None:
+    """FP32 PyTorch fallback reducer supporting lazy (max, denom) metadata."""
+    # logits: [S, splits, H, Dv]
+    # attn_lse: [S, splits, H, 2] with [split_max, split_denom]
+    split_max = attn_lse[..., 0]
+    split_denom = attn_lse[..., 1].clamp_min_(1e-20)
+    global_max = split_max.max(dim=1, keepdim=True).values
+    weights = torch.exp2((split_max - global_max) * _LOG2E).unsqueeze(-1)
+    numer = (logits * weights).sum(dim=1, keepdim=False)
+    denom = (
+        (split_denom * weights.squeeze(-1)).sum(dim=1, keepdim=False).clamp_min_(1e-20)
+    )
+    out.copy_((numer / denom.unsqueeze(-1)).to(dtype=out.dtype))
+    final_lse.copy_(global_max.squeeze(1) + torch.log2(denom) * _LN2)
+
+
 @functools.lru_cache()
 def get_meta_param(num_kv_splits, bs, total_kv, nhead, max_seqlen_q, dtype):
     if num_kv_splits is None:
@@ -125,6 +485,18 @@ def get_meta_param(num_kv_splits, bs, total_kv, nhead, max_seqlen_q, dtype):
         num_kv_splits = sorted(tmp, key=lambda x: x[0], reverse=True)[0][1]
 
     get_block_n_fp8 = {
+        4: 128,
+        5: 128,
+        6: 128,
+        7: 128,
+        8: 128,
+        9: 128,
+        10: 128,
+        11: 128,
+        12: 128,
+        13: 128,
+        14: 128,
+        15: 128,
         16: 128,
         32: 128,
         48: 64,
@@ -205,6 +577,117 @@ def mla_decode_fwd(
             num_kv_splits, num_kv_splits_indptr = get_meta_param(
                 num_kv_splits, bs, total_kv, nhead, max_seqlen_q, q.dtype
             )
+
+        # ----- MFMA head-4 early-return path (TP=8 Kimi Linear) -----
+        mfma_total_kv = int(kv_indptr[-1].item() - kv_indptr[0].item())
+        if (
+            _MLA_STAGE1_MODE == "mfma_head4"
+            and bs == 1
+            and max_seqlen_q == 1
+            and int(nhead) == _MLA_STAGE1_MFMA_HEADS
+            and q.dtype == dtypes.bf16
+            and kv_buffer.dtype in (torch.uint8, dtypes.fp8)
+            and _MLA_STAGE1_MFMA_MIN_TOKENS <= mfma_total_kv
+        ):
+            mfma_num_kv_splits = min(256, mfma_total_kv)
+            mfma_num_kv_splits = max(1, mfma_num_kv_splits)
+            kv_len_per_split = math.ceil(mfma_total_kv / mfma_num_kv_splits)
+            mfma_num_kv_splits_indptr = torch.arange(
+                0,
+                (bs + 1) * mfma_num_kv_splits,
+                mfma_num_kv_splits,
+                dtype=torch.int,
+                device=device,
+            )
+
+            global _MLA_STAGE1_MFMA_LOGGED
+            if not _MLA_STAGE1_MFMA_LOGGED:
+                print(
+                    "[aiter.mla] stage1 mode=mfma_head4 (fused): "
+                    f"total_kv={mfma_total_kv} "
+                    f"num_kv_splits={mfma_num_kv_splits} "
+                    f"kv_len_per_split={kv_len_per_split} "
+                    f"min_tokens={_MLA_STAGE1_MFMA_MIN_TOKENS}",
+                    flush=True,
+                )
+                _MLA_STAGE1_MFMA_LOGGED = True
+
+            mfma_logits = torch.empty(
+                (total_s, mfma_num_kv_splits, nhead, v_head_dim),
+                dtype=dtypes.fp32,
+                device=device,
+            )
+            mfma_attn_lse = torch.empty(
+                (total_s, mfma_num_kv_splits, nhead, 2),
+                dtype=dtypes.fp32,
+                device=device,
+            )
+            mfma_final_lse = torch.empty(
+                (total_s, nhead), dtype=dtypes.fp32, device=device
+            )
+
+            _mla_stage1_head4_mfma(
+                q=q,
+                kv_buffer=kv_buffer,
+                logits=mfma_logits,
+                attn_lse=mfma_attn_lse,
+                kv_indptr=kv_indptr,
+                kv_indices=kv_indices,
+                num_kv_splits=mfma_num_kv_splits,
+                sm_scale=float(sm_scale),
+                kv_scale=kv_scale,
+                v_head_dim=int(v_head_dim),
+            )
+
+            # Single-split shortcut: direct divide
+            if mfma_num_kv_splits == 1:
+                numer = mfma_logits[:, 0].to(torch.float32)
+                s_max = mfma_attn_lse[:, 0, :, 0].to(torch.float32)
+                s_denom = mfma_attn_lse[:, 0, :, 1].to(torch.float32).clamp_min_(1e-20)
+                final = numer / s_denom.unsqueeze(-1)
+                o.copy_(final.to(dtype=o.dtype))
+                mfma_final_lse.copy_(s_max + torch.log(s_denom))
+                return o, mfma_final_lse
+
+            # Multi-split stage-2 reduction
+            if _MLA_STAGE2_MODE == "torch_ref":
+                _mla_stage2_reduce_torch_ref(
+                    logits=mfma_logits,
+                    attn_lse=mfma_attn_lse,
+                    out=o,
+                    final_lse=mfma_final_lse,
+                )
+            else:
+                Lv = v_head_dim
+                BLOCK_DV = triton.next_power_of_2(Lv)
+                mgc_mfma = 16
+                grid = (bs, nhead)
+                _fwd_kernel_stage2_lazy_meta[grid](
+                    mfma_logits,
+                    mfma_attn_lse,
+                    o,
+                    qo_indptr,
+                    kv_indptr,
+                    mfma_num_kv_splits_indptr,
+                    mfma_logits.stride(0),
+                    mfma_logits.stride(2),
+                    mfma_logits.stride(1),
+                    mfma_attn_lse.stride(0),
+                    mfma_attn_lse.stride(2),
+                    mfma_attn_lse.stride(1),
+                    o.stride(0),
+                    o.stride(1),
+                    BATCH_NUM=bs,
+                    BLOCK_DV=BLOCK_DV,
+                    Lv=Lv,
+                    mgc=mgc_mfma,
+                    num_warps=4,
+                    num_stages=2,
+                    waves_per_eu=4,
+                )
+
+            return mfma_logits, mfma_final_lse
+        # ----- End MFMA head-4 path -----
 
         mgc = 64 if max_seqlen_q == 1 and nhead == 16 else 16
         mgc = (

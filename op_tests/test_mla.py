@@ -3,6 +3,7 @@
 
 import argparse
 import itertools
+import os
 import random
 import pandas as pd
 import torch
@@ -555,6 +556,44 @@ def test_mla(
         )
         return err, us_triton_decode
 
+    def test_absorb_decode_mfma_head4():
+        """MFMA head-4 decode: BF16 Q + FP8 KV (TP=8 Kimi Linear regime).
+
+        Requires VLLM_AITER_MLA_STAGE1_MODE=mfma_head4 and
+        VLLM_AITER_MLA_STAGE1_MFMA_MIN_TOKENS set low enough for the test
+        context length.
+        """
+        kv_last_page_lens = torch.ones(batch_size, dtype=torch.int)
+        out_mfma = torch.empty((total_q, nhead, v_head_dim), dtype=out_dtype).fill_(-1)
+
+        kv_buffer_fp8 = kv_buffer.to(dtypes.fp8)
+        kv_scale = torch.ones([1], dtype=torch.float, device="cuda")
+
+        (attn_logits, attn_lse), us_mfma_decode = run_perftest(
+            aiter.mla.mla_decode_fwd,
+            q,
+            kv_buffer_fp8.view(num_page, page_size, nhead_kv, qk_head_dim),
+            out_mfma,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            kv_last_page_lens,
+            max_seqlen_qo,
+            page_size,
+            nhead_kv,
+            sm_scale,
+            kv_scale=kv_scale,
+            num_kv_splits=split_per_batch,
+        )
+
+        err = checkAllclose(
+            out_ref,
+            out_mfma,
+            msg=f"mla_decode-mfma_head4 [golden vs mfma]: {us_mfma_decode:>8.2f} us......",
+        )
+        cal_diff(out_ref, out_mfma, "out_mfma", True)
+        return err, us_mfma_decode
+
     err = None
     us_asm_decode = 1e12
     if (dtype == torch.bfloat16 and kvtype == torch.bfloat16) and nhead in [
@@ -620,6 +659,22 @@ def test_mla(
         ret["decode:triton_err"] = err_triton
     ret["decode:triton_576"] = us_triton_decode
 
+    # MFMA head-4 decode test (BF16 Q + FP8 KV, nhead=4, decode_qlen=1)
+    # Activate with: VLLM_AITER_MLA_STAGE1_MODE=mfma_head4
+    #                VLLM_AITER_MLA_STAGE1_MFMA_MIN_TOKENS=1
+    us_mfma_decode = 1e12
+    mfma_heads = int(os.environ.get("VLLM_AITER_MLA_STAGE1_MFMA_HEADS", "4"))
+    if (
+        nhead == mfma_heads
+        and decode_qlen == 1
+        and dtype == torch.bfloat16
+        and batch_size == 1
+        and os.environ.get("VLLM_AITER_MLA_STAGE1_MODE", "") == "mfma_head4"
+    ):
+        err_mfma, us_mfma_decode = test_absorb_decode_mfma_head4()
+        ret["decode:mfma_err"] = err_mfma
+    ret["decode:mfma_576"] = us_mfma_decode
+
     flops = decode_qlen * total_kv * nhead * (qk_head_dim + v_head_dim) * 2
     bytes = (
         total_kv * nhead_kv * qk_head_dim * (torch.finfo(kvtype).bits // 8)
@@ -635,6 +690,8 @@ def test_mla(
     ret["decode:gluon_TB/s"] = bytes / us_gluon_decode / 1e6
     ret["decode:triton_TFLOPS"] = flops / us_triton_decode / 1e6
     ret["decode:triton_TB/s"] = bytes / us_triton_decode / 1e6
+    ret["decode:mfma_TFLOPS"] = flops / us_mfma_decode / 1e6
+    ret["decode:mfma_TB/s"] = bytes / us_mfma_decode / 1e6
 
     return ret
 
