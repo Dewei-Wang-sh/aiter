@@ -18,6 +18,7 @@
 #     LLP, ACK                           -- local_load pages [i+1], async_copy K/KPE [i+1]
 #     LLK, MFMA0, softmax, LLV, MFMA1   -- compute on [i]: QK dot, softmax, PV dot
 
+import torch
 import triton
 import triton.language as tl
 from triton.experimental import gluon
@@ -96,7 +97,7 @@ def _mla_decode_gluon_bh16bn128(
         block_bases=[],
         shape=[16, 64],
     )
-    shared_q_pe: gl.constexpr = gl.SwizzledSharedLayout(vec=8, per_phase=2, max_phase=8, order=[0, 1])
+    shared_q_pe: gl.constexpr = gl.SwizzledSharedLayout(vec=8, per_phase=2, max_phase=8, order=[1, 0])
 
     # layout for KV
     # 512x128xfp8
@@ -138,18 +139,26 @@ def _mla_decode_gluon_bh16bn128(
     )
     shared_kpe: gl.constexpr = gl.PaddedSharedLayout(
         interval_padding_pairs=[[2048, 16]],
-        offset_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [0, 4], [0, 8], [0, 16], [0, 32], [0, 1], [0, 2]],
+        offset_bases=[[1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0], [0, 4], [0, 8], [0, 16], [0, 32], [0, 64], [0, 1], [0, 2]],
         cga_layout=[],
         shape=[64, 128]
     )
 
     linear_v: gl.constexpr = gl.DistributedLinearLayout(
-        reg_bases=((0, 1), (0, 2), (0, 4), (0, 32), (0, 64), (16, 0), (32, 0), (64, 0)),
+        reg_bases=((0, 1), (0, 2), (0, 4), (0, 32), (0, 64), (64, 0), (128, 0), (256, 0)),
         lane_bases=((1, 0), (2, 0), (4, 0), (8, 0), (0, 8), (0, 16)),
-        warp_bases=((128, 0), (256, 0)),
+        warp_bases=((16, 0), (32, 0)),
         block_bases=[],
         shape=[512, 128],
     )
+    # tileperWarp=1,8
+    # linear_v: gl.constexpr = gl.DistributedLinearLayout(
+    #     reg_bases=((0, 1), (0, 2), (0, 4), (0, 32), (0, 64), (16, 0), (32, 0), (64, 0)),
+    #     lane_bases=((1, 0), (2, 0), (4, 0), (8, 0), (0, 8), (0, 16)),
+    #     warp_bases=((128, 0), (256, 0)),
+    #     block_bases=[],
+    #     shape=[512, 128],
+    # )
 
     # layout for mfma
     mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
@@ -176,9 +185,10 @@ def _mla_decode_gluon_bh16bn128(
         block_bases=[],
         shape=[512, 64],
     )
+    dtype = Q_nope.type.element_ty
+    kvtype = Kv_c_cache.type.element_ty
     ######### layout setting end #########
 
-    dtype = Q_nope.type.element_ty
     buf_q_nope = gl.allocate_shared_memory(dtype, shape=[BLOCK_H, HEAD_DIM_CKV], layout=shared_q_nope)
     buf_q_pe = gl.allocate_shared_memory(dtype, shape=[BLOCK_H, HEAD_DIM_KPE], layout=shared_q_pe)
 
@@ -234,8 +244,8 @@ def _mla_decode_gluon_bh16bn128(
     q_pe = gl.amd.cdna4.async_copy.load_shared_relaxed(buf_q_pe, mfma_layout_a)
 
     #################### move here to work around allocate_shared_memory bug
-    bufs_kv = gl.allocate_shared_memory(dtype, shape=[2, HEAD_DIM_CKV, BLOCK_N], layout=shared_kv)
-    bufs_kpe = gl.allocate_shared_memory(dtype, shape=[2, HEAD_DIM_KPE, BLOCK_N], layout=shared_kpe)
+    bufs_kv = gl.allocate_shared_memory(kvtype, shape=[2, HEAD_DIM_CKV, BLOCK_N], layout=shared_kv)
+    bufs_kpe = gl.allocate_shared_memory(kvtype, shape=[2, HEAD_DIM_KPE, BLOCK_N], layout=shared_kpe)
 
     #### global load K
     # local load page number
@@ -245,14 +255,14 @@ def _mla_decode_gluon_bh16bn128(
     kv_loc_pe = kv_page_number_pe
 
     # local load page number for slice 0
-    bufs_page_0 = bufs_page.index(0).slice(0, BLOCK_N / 2, 0)
+    bufs_page_0 = bufs_page.index(0).slice(0, BLOCK_N // 2, 0)
     kv_page_number_0 = gl.amd.cdna4.async_copy.load_shared_relaxed(bufs_page_0, gl.SliceLayout(0, blocked_kv_slice))
     kv_loc0 = kv_page_number_0
 
     # global load K_nope slice 0
     offs_d_ckv_10 = gl.arange(0, HEAD_DIM_CKV, layout=gl.SliceLayout(1, blocked_kv_slice))
     offs_k_c0 = kv_loc0[None, :] * stride_kv_c_bs + offs_d_ckv_10[:, None]
-    bufs_kv0 = bufs_kv.index(0).slice(0, BLOCK_N / 2, 1)
+    bufs_kv0 = bufs_kv.index(0).slice(0, BLOCK_N // 2, 1)
     if WITHIN_2GB:
         gl.amd.cdna4.async_copy.buffer_load_to_shared(bufs_kv0, Kv_c_cache, offs_k_c0)
     else:
@@ -269,12 +279,12 @@ def _mla_decode_gluon_bh16bn128(
     gl.amd.cdna4.async_copy.commit_group()
 
     # local load page number for slice 1
-    bufs_page_1 = bufs_page.index(0).slice(BLOCK_N / 2, BLOCK_N / 2, 0)
+    bufs_page_1 = bufs_page.index(0).slice(BLOCK_N // 2, BLOCK_N // 2, 0)
     kv_page_number_1 = gl.amd.cdna4.async_copy.load_shared_relaxed(bufs_page_1, gl.SliceLayout(0, blocked_kv_slice))
     kv_loc1 = kv_page_number_1
 
     # global load K_nope slice 1
-    bufs_kv1 = bufs_kv.index(0).slice(BLOCK_N / 2, BLOCK_N / 2, 1)
+    bufs_kv1 = bufs_kv.index(0).slice(BLOCK_N // 2, BLOCK_N // 2, 1)
     offs_k_c1 = kv_loc1[None, :] * stride_kv_c_bs + offs_d_ckv_10[:, None]
     if WITHIN_2GB:
         gl.amd.cdna4.async_copy.buffer_load_to_shared(bufs_kv1, Kv_c_cache, offs_k_c1)
@@ -296,14 +306,14 @@ def _mla_decode_gluon_bh16bn128(
         gl.amd.cdna4.async_copy.commit_group()
 
         #### global load K
-        bufs_kv0 = bufs_kv.index(async_idx).slice(0, BLOCK_N / 2, 1)
-        bufs_kv1 = bufs_kv.index(async_idx).slice(BLOCK_N / 2, BLOCK_N / 2, 1)
+        bufs_kv0 = bufs_kv.index(async_idx).slice(0, BLOCK_N // 2, 1)
+        bufs_kv1 = bufs_kv.index(async_idx).slice(BLOCK_N // 2, BLOCK_N // 2, 1)
         # local load page number for slice 0
-        bufs_page_0 = bufs_page.index(async_idx).slice(0, BLOCK_N / 2, 0)
+        bufs_page_0 = bufs_page.index(async_idx).slice(0, BLOCK_N // 2, 0)
         kv_page_number_0 = gl.amd.cdna4.async_copy.load_shared_relaxed(bufs_page_0, gl.SliceLayout(0, blocked_kv_slice))
         kv_loc0 = kv_page_number_0
         # global load K_nope slice 0
-        offs_n_nope0 = start_n + gl.arange(0, BLOCK_N / 2, layout=gl.SliceLayout(0, blocked_kv_slice))
+        offs_n_nope0 = start_n + gl.arange(0, BLOCK_N // 2, layout=gl.SliceLayout(0, blocked_kv_slice))
         offs_d_ckv_10 = gl.arange(0, HEAD_DIM_CKV, layout=gl.SliceLayout(1, blocked_kv_slice))
         offs_k_c0 = kv_loc0[None, :] * stride_kv_c_bs + offs_d_ckv_10[:, None]
         if WITHIN_2GB:
@@ -332,19 +342,17 @@ def _mla_decode_gluon_bh16bn128(
 
         #### dot, softmax, dot (part0)
         k_c = gl.amd.cdna4.async_copy.load_shared_relaxed(bufs_kv.index(buf_idx), mfma_layout_b)
-        k_c = k_c.to(dtype)
         zeros = gl.zeros([BLOCK_H, BLOCK_N], dtype=gl.float32, layout=mfma_layout)
-        qk = gl.amd.cdna4.mfma(q_nope, k_c.to(q_nope.dtype), zeros)
+        qk = gl.amd.cdna4.mfma(q_nope, k_c.to(dtype), zeros)
         k_pe = gl.amd.cdna4.async_copy.load_shared_relaxed(bufs_kpe.index(buf_idx), mfma_layout_b)
-        k_pe = k_pe.to(dtype)
-        qk = gl.amd.cdna4.mfma(q_pe, k_pe.to(q_pe.dtype), qk)
+        qk = gl.amd.cdna4.mfma(q_pe, k_pe.to(dtype), qk)
 
         # local load page number for slice 1
-        bufs_page_1 = bufs_page.index(async_idx).slice(BLOCK_N / 2, BLOCK_N / 2, 0)
+        bufs_page_1 = bufs_page.index(async_idx).slice(BLOCK_N // 2, BLOCK_N // 2, 0)
         kv_page_number_1 = gl.amd.cdna4.async_copy.load_shared_relaxed(bufs_page_1, gl.SliceLayout(0, blocked_kv_slice))
         kv_loc1 = kv_page_number_1
         # global load K_nope slice 1
-        offs_n1 = offs_n_nope0 + BLOCK_N / 2
+        offs_n1 = offs_n_nope0 + BLOCK_N // 2
         offs_k_c1 = kv_loc1[None, :] * stride_kv_c_bs + offs_d_ckv_10[:, None]
         if WITHIN_2GB:
             gl.amd.cdna4.async_copy.buffer_load_to_shared(bufs_kv1, Kv_c_cache, offs_k_c1, mask=offs_n1[None, :] < split_kv_end)
@@ -425,6 +433,7 @@ def _mla_decode_gluon_bh16bn128(
     p = gl.convert_layout(p, mfma_layout_a)
     acc *= re_scale[:, None]
     v_c = bufs_kv.index(buf_idx).load(layout=linear_v)
+    v_c = v_c.to(dtype)
     v_c = gl.permute(v_c, [1, 0])
     v_c = gl.convert_layout(v_c, mfma_layout_b)
     acc = gl.amd.cdna4.mfma(p, v_c, acc)
@@ -452,6 +461,7 @@ def _mla_decode_gluon_bh16bn128(
     p = gl.convert_layout(p, mfma_layout_a)
     acc *= re_scale[:, None]
     v_c = bufs_kv.index(buf_idx).load(layout=linear_v)
+    v_c = v_c.to(dtype)
     v_c = gl.permute(v_c, [1, 0])
     v_c = gl.convert_layout(v_c, mfma_layout_b)
     acc = gl.amd.cdna4.mfma(p, v_c, acc)
@@ -466,10 +476,21 @@ def _mla_decode_gluon_bh16bn128(
     # store lse
     offs_o1 = cur_batch * stride_o_b + cur_head_o * stride_o_h + split_kv_id * stride_o_s + HEAD_DIM_CKV
     lse = e_max + gl.log(e_sum)
-    gl.amd.cdna4.buffer_store(lse, ptr=O, offsets=offs_o1)
+    gl.amd.cdna4.buffer_store(lse.to(dtype), ptr=O, offsets=offs_o1)
 # fmt: on
 
 # fmt: off
+# TODO: in the fallback path, compute num_valid_kv_splits upfront
+# (= cdiv(cur_batch_seq_len, cdiv(cur_batch_seq_len, NUM_KV_SPLITS)))
+# and loop only that many iterations, eliminating the per-iteration
+# bounds check. See _fwd_kernel_stage2_asm in aiter/mla.py.
+# @triton.autotune(
+#     configs=[
+#         triton.Config({}, num_warps=w, num_stages=s)
+#         for w in [1, 2, 4, 8] for s in [1, 2]
+#     ],
+#     key=["NUM_KV_SPLITS", "HEAD_DIM_CKV", "ALL_SPLITS_NONEMPTY"],
+# )
 @triton.jit
 def _mla_softmax_reducev_kernel(
     Logits,
@@ -483,43 +504,46 @@ def _mla_softmax_reducev_kernel(
     NUM_KV_SPLITS: tl.constexpr,
     HEAD_DIM_CKV: tl.constexpr,
     USE_2D_VIEW: tl.constexpr,
+    ALL_SPLITS_NONEMPTY: tl.constexpr,
 ):
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
 
-    if USE_2D_VIEW:
-        cur_batch_seq_len = tl.load(B_seq_len + cur_batch)
-    else:
-        cur_batch_seq_len = tl.load(B_seq_len + cur_batch + 1) - tl.load(
-            B_seq_len + cur_batch
-        )
-
     offs_d_ckv = tl.arange(0, HEAD_DIM_CKV)
+    offs_l = cur_batch * stride_l_b + cur_head * stride_l_h + offs_d_ckv
+    offs_l_1 = cur_batch * stride_l_b + cur_head * stride_l_h + HEAD_DIM_CKV
 
     e_sum = 0.0
     e_max = -float("inf")
     acc = tl.zeros([HEAD_DIM_CKV], dtype=tl.float32)
 
-    offs_l = cur_batch * stride_l_b + cur_head * stride_l_h + offs_d_ckv
-    offs_l_1 = cur_batch * stride_l_b + cur_head * stride_l_h + HEAD_DIM_CKV
+    if not ALL_SPLITS_NONEMPTY:
+        if USE_2D_VIEW:
+            cur_batch_seq_len = tl.load(B_seq_len + cur_batch)
+        else:
+            cur_batch_seq_len = tl.load(B_seq_len + cur_batch + 1) - tl.load(
+                B_seq_len + cur_batch
+            )
 
     for split_kv_id in range(0, NUM_KV_SPLITS):
-        kv_len_per_split = tl.cdiv(cur_batch_seq_len, NUM_KV_SPLITS)
-        split_kv_start = kv_len_per_split * split_kv_id
-        split_kv_end = tl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
+        if not ALL_SPLITS_NONEMPTY:
+            kv_len_per_split = tl.cdiv(cur_batch_seq_len, NUM_KV_SPLITS)
+            split_kv_start = kv_len_per_split * split_kv_id
+            split_kv_end = tl.minimum(split_kv_start + kv_len_per_split, cur_batch_seq_len)
+            if split_kv_end <= split_kv_start:
+                continue
 
-        if split_kv_end > split_kv_start:
-            logits = tl.load(Logits + offs_l + split_kv_id * stride_l_s)
-            logits_1 = tl.load(Logits + offs_l_1 + split_kv_id * stride_l_s)
+        logits = tl.load(Logits + offs_l + split_kv_id * stride_l_s)
+        logits_1 = tl.load(Logits + offs_l_1 + split_kv_id * stride_l_s)
 
-            n_e_max = tl.maximum(logits_1, e_max)
-            old_scale = tl.exp(e_max - n_e_max)
-            acc *= old_scale
-            exp_logic = tl.exp(logits_1 - n_e_max)
-            acc += exp_logic * logits
+        n_e_max = tl.maximum(logits_1, e_max)
+        old_scale = tl.exp(e_max - n_e_max)
+        acc *= old_scale
+        exp_logic = tl.exp(logits_1 - n_e_max)
+        acc += exp_logic * logits
 
-            e_sum = e_sum * old_scale + exp_logic
-            e_max = n_e_max
+        e_sum = e_sum * old_scale + exp_logic
+        e_max = n_e_max
 
     tl.store(
         O + cur_batch * stride_o_b + cur_head * stride_o_h + offs_d_ckv,
@@ -577,7 +601,11 @@ def mla_decode_gluon(
         min_seq_len_wg >= BLOCK_N * 3
     ), f"mla_decode_gluon requires min_seq_len_wg >= BLOCK_N * 3, got min_seq_len_wg={min_seq_len_wg}"
 
-    attn_logits = o.view(batch_size, nhead, NUM_KV_SPLITS, head_dim_ckv + 1)
+    attn_logits = torch.empty(
+        (batch_size, nhead, NUM_KV_SPLITS, head_dim_ckv + 1),
+        dtype=o.dtype,
+        device=o.device,
+    )
     grid = (NUM_KV_SPLITS,)
     stride_page_bs = page_table.stride(0) if use_2d_view else 0
 
@@ -612,6 +640,7 @@ def mla_decode_gluon(
         WITHIN_2GB=within_2gb,
     )
     grid_reduce = (batch_size, nhead)
+    all_splits_nonempty = min_kv_seq_len > (NUM_KV_SPLITS - 1) ** 2
     _mla_softmax_reducev_kernel[grid_reduce](
         attn_logits,
         seq_info,
@@ -624,7 +653,8 @@ def mla_decode_gluon(
         NUM_KV_SPLITS=NUM_KV_SPLITS,
         HEAD_DIM_CKV=head_dim_ckv,
         USE_2D_VIEW=use_2d_view,
-        num_warps=4,
-        num_stages=2,
+        ALL_SPLITS_NONEMPTY=all_splits_nonempty,
+        num_warps=8,
+        num_stages=1,
     )
     return o, None

@@ -556,6 +556,50 @@ def test_mla(
         )
         return err, us_triton_decode
 
+    def test_absorb_decode_gluon_bh16bn128():
+        from aiter.ops.triton.gluon.mla_decode_gluon_bh16bn128 import (
+            mla_decode_gluon as mla_decode_gluon_bh16bn128,
+        )
+
+        out_gluon = torch.empty((total_q, nhead, v_head_dim), dtype=out_dtype).fill_(-1)
+
+        q_nope = q[:, :, :v_head_dim].view(batch_size, nhead, v_head_dim)
+        q_pe = q[:, :, v_head_dim:].view(batch_size, nhead, qk_head_dim - v_head_dim)
+
+        # bh16bn128 requires fp8 KV; bf16 buffer cast directly so kv_scale=1.0
+        kv_c = kv_buffer.view(-1, qk_head_dim).to(dtypes.fp8)
+
+        if not varlen:
+            page_table = kv_indices[:total_kv].view(batch_size, ctx_lens)
+            seq_info = seq_lens_kv
+            use_2d_view = True
+        else:
+            page_table = kv_indices
+            seq_info = kv_indptr
+            use_2d_view = False
+
+        (attn_logits, attn_lse), us_decode = run_perftest(
+            mla_decode_gluon_bh16bn128,
+            q_nope,
+            q_pe,
+            kv_c,
+            out_gluon.view(batch_size, nhead, v_head_dim),
+            page_table,
+            seq_info,
+            sm_scale,
+            use_2d_view=use_2d_view,
+            kv_scale=1.0,
+            min_kv_seq_len=ctx_lens,
+        )
+
+        err = checkAllclose(
+            out_ref,
+            out_gluon,
+            msg=f"mla_decode-absorb    [golden vs gluon_bh16bn128]: {us_decode:>8.2f} us......",
+        )
+        cal_diff(out_ref, out_gluon, "out_gluon_bh16bn128", True)
+        return err, us_decode
+
     def test_absorb_decode_mfma_head4():
         """MFMA head-4 decode: BF16 Q + FP8 KV (TP=8 Kimi Linear regime).
 
@@ -594,6 +638,15 @@ def test_mla(
         cal_diff(out_ref, out_mfma, "out_mfma", True)
         return err, us_mfma_decode
 
+    flops = decode_qlen * total_kv * nhead * (qk_head_dim + v_head_dim) * 2
+    bytes = (
+        total_kv * nhead_kv * qk_head_dim * (torch.finfo(kvtype).bits // 8)
+        + total_q * nhead * qk_head_dim * (torch.finfo(dtype).bits // 8)
+        + total_q * nhead * v_head_dim * (torch.finfo(out_dtype).bits // 8)
+    )
+    ret["decode:flops"] = flops
+    ret["decode:bytes"] = bytes
+
     err = None
     us_asm_decode = 1e12
     if (dtype == torch.bfloat16 and kvtype == torch.bfloat16) and nhead in [
@@ -608,6 +661,8 @@ def test_mla(
 
     ret["decode:err"] = err
     ret["decode:asm_576"] = us_asm_decode
+    ret["decode:TFLOPS"] = flops / us_asm_decode / 1e6
+    ret["decode:TB/s"] = bytes / us_asm_decode / 1e6
 
     # Gluon MLA decode test (bf16 only, nhead in (64,128), decode_qlen=1,
     # head_dim_ckv=512, head_dim_kpe=64, batch in (64,128,256), page_size=1).
@@ -641,11 +696,38 @@ def test_mla(
         if ctx_lens > min_ctx_required:
             err_gluon, us_gluon_decode = test_absorb_decode_gluon()
             ret["decode:gluon_err"] = err_gluon
-    ret["decode:gluon_576"] = us_gluon_decode
+            err_gluon, us_gluon_decode = test_absorb_decode_gluon()
+            ret["decode:gluon_err"] = err_gluon
+            ret["decode:gluon_576_us"] = us_gluon_decode
+            ret["decode:gluon_TFLOPS"] = flops / us_gluon_decode / 1e6
+            ret["decode:gluon_TB/s"] = bytes / us_gluon_decode / 1e6
+
+    # Gluon MLA bh16bn128 decode test (gfx950, bf16 Q + fp8 KV, nhead=16, batch=1,
+    # decode_qlen=1, head_dim_ckv=512, head_dim_kpe=64, page_size=1).
+    # NUM_KV_SPLITS=256 hardcoded; kernel asserts min_kv_seq_len // 256 >= BLOCK_N*3,
+    # i.e. min_kv_seq_len >= 98304. Example: -c 98304 -b 1 -n 16,1 -d bf16 -kvd fp8
+    if (
+        get_gfx() == "gfx950"
+        and dtype == torch.bfloat16
+        and kvtype == dtypes.fp8
+        and nhead == 16
+        and decode_qlen == 1
+        and batch_size == 1
+        and v_head_dim == 512
+        and (qk_head_dim - v_head_dim) == 64
+        and page_size == 1
+        and ctx_lens >= 256 * 128 * 3
+    ):
+        err_gluon_bh16bn128, us_gluon_bh16bn128_decode = (
+            test_absorb_decode_gluon_bh16bn128()
+        )
+        ret["decode:gluon_bh16bn128_err"] = err_gluon_bh16bn128
+        ret["decode:gluon_bh16bn128_576_us"] = us_gluon_bh16bn128_decode
+        ret["decode:gluon_bh16bn128_TFLOPS"] = flops / us_gluon_bh16bn128_decode / 1e6
+        ret["decode:gluon_bh16bn128_TB/s"] = bytes / us_gluon_bh16bn128_decode / 1e6
 
     # Triton MLA decode test (bf16 Q, bf16/fp8 KV, nhead multiple of 4,
     # decode_qlen=1, head_dim_ckv=512, head_dim_kpe=64, page_size=1)
-    us_triton_decode = 1e12
     if (
         dtype == torch.bfloat16
         and kvtype in (torch.bfloat16, dtypes.fp8)
@@ -655,14 +737,16 @@ def test_mla(
         and (qk_head_dim - v_head_dim) == 64
         and page_size == 1
     ):
-        err_triton, us_triton_decode = test_absorb_decode_triton()
-        ret["decode:triton_err"] = err_triton
-    ret["decode:triton_576"] = us_triton_decode
+        # err_triton, us_triton_decode = test_absorb_decode_triton()
+        # ret["decode:triton_err"] = err_triton
+        # ret["decode:triton_576_us"] = us_triton_decode
+        # ret["decode:triton_TFLOPS"] = flops / us_triton_decode / 1e6
+        # ret["decode:triton_TB/s"] = bytes / us_triton_decode / 1e6
+        pass
 
     # MFMA head-4 decode test (BF16 Q + FP8 KV, nhead=4, decode_qlen=1)
     # Activate with: VLLM_AITER_MLA_STAGE1_MODE=mfma_head4
     #                VLLM_AITER_MLA_STAGE1_MFMA_MIN_TOKENS=1
-    us_mfma_decode = 1e12
     mfma_heads = int(os.environ.get("VLLM_AITER_MLA_STAGE1_MFMA_HEADS", "4"))
     if (
         nhead == mfma_heads
@@ -671,27 +755,12 @@ def test_mla(
         and batch_size == 1
         and os.environ.get("VLLM_AITER_MLA_STAGE1_MODE", "") == "mfma_head4"
     ):
-        err_mfma, us_mfma_decode = test_absorb_decode_mfma_head4()
-        ret["decode:mfma_err"] = err_mfma
-    ret["decode:mfma_576"] = us_mfma_decode
-
-    flops = decode_qlen * total_kv * nhead * (qk_head_dim + v_head_dim) * 2
-    bytes = (
-        total_kv * nhead_kv * qk_head_dim * (torch.finfo(kvtype).bits // 8)
-        + total_q * nhead * qk_head_dim * (torch.finfo(dtype).bits // 8)
-        + total_q * nhead * v_head_dim * (torch.finfo(out_dtype).bits // 8)
-    )
-
-    ret["decode:flops"] = flops
-    ret["decode:bytes"] = bytes
-    ret["decode:TFLOPS"] = flops / us_asm_decode / 1e6
-    ret["decode:TB/s"] = bytes / us_asm_decode / 1e6
-    ret["decode:gluon_TFLOPS"] = flops / us_gluon_decode / 1e6
-    ret["decode:gluon_TB/s"] = bytes / us_gluon_decode / 1e6
-    ret["decode:triton_TFLOPS"] = flops / us_triton_decode / 1e6
-    ret["decode:triton_TB/s"] = bytes / us_triton_decode / 1e6
-    ret["decode:mfma_TFLOPS"] = flops / us_mfma_decode / 1e6
-    ret["decode:mfma_TB/s"] = bytes / us_mfma_decode / 1e6
+        # err_mfma, us_mfma_decode = test_absorb_decode_mfma_head4()
+        # ret["decode:mfma_err"] = err_mfma
+        # ret["decode:mfma_576_us"] = us_mfma_decode
+        # ret["decode:mfma_TFLOPS"] = flops / us_mfma_decode / 1e6
+        # ret["decode:mfma_TB/s"] = bytes / us_mfma_decode / 1e6
+        pass
 
     return ret
 
