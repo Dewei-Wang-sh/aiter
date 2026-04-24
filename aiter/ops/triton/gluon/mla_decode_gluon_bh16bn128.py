@@ -58,6 +58,7 @@ def _mla_decode_gluon_bh16bn128(
     KV_PE_OFFSET: gl.constexpr,
     USE_2D_VIEW: gl.constexpr,
     WITHIN_2GB: gl.constexpr,
+    NHEAD: gl.constexpr,
 ):
     cur_batch = 0
     cur_head_id = 0
@@ -196,14 +197,15 @@ def _mla_decode_gluon_bh16bn128(
     offs_d_ckv = gl.arange(0, HEAD_DIM_CKV, layout=gl.SliceLayout(0, blocked_q_nope))
     cur_head = cur_head_id * BLOCK_H + gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, blocked_q_nope))
     offs_q_nope = cur_batch * stride_q_nope_bs + cur_head[:, None] * stride_q_nope_h + offs_d_ckv[None, :]
-    gl.amd.cdna4.async_copy.buffer_load_to_shared(buf_q_nope, Q_nope, offs_q_nope)
+    ### For nhead < BLOCK_H, mask OOB heads to zero on Q load and skip OOB O stores; wasted MFMA lanes are free (memory-bound).
+    gl.amd.cdna4.async_copy.buffer_load_to_shared(buf_q_nope, Q_nope, offs_q_nope, mask = (cur_head < NHEAD)[:, None] if NHEAD < BLOCK_H else None)
     gl.amd.cdna4.async_copy.commit_group()
 
     # load q_pe
     offs_d_kpe = gl.arange(0, HEAD_DIM_KPE, layout=gl.SliceLayout(0, blocked_q_pe))
     cur_head_qpe = cur_head_id * BLOCK_H + gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, blocked_q_pe))
     offs_q_pe = cur_batch * stride_q_pe_bs + cur_head_qpe[:, None] * stride_q_pe_h + offs_d_kpe[None, :]
-    gl.amd.cdna4.async_copy.buffer_load_to_shared(buf_q_pe, Q_pe, offs_q_pe)
+    gl.amd.cdna4.async_copy.buffer_load_to_shared(buf_q_pe, Q_pe, offs_q_pe, mask = (cur_head_qpe < NHEAD)[:, None] if NHEAD < BLOCK_H else None)
     gl.amd.cdna4.async_copy.commit_group()
 
     e_max = gl.zeros([BLOCK_H], dtype=gl.float32, layout=gl.SliceLayout(1, mfma_layout)) - float("inf")
@@ -472,11 +474,17 @@ def _mla_decode_gluon_bh16bn128(
     acc *= kv_scale
     rcp = 1.0 / e_sum
     stored_value = (acc * rcp[:, None]).to(dtype)
-    gl.amd.cdna4.buffer_store(stored_value, ptr=O, offsets=offs_o)
+    if NHEAD < BLOCK_H:
+        gl.amd.cdna4.buffer_store(stored_value, ptr=O, offsets=offs_o, mask=(cur_head_o < NHEAD)[:, None])
+    else:
+        gl.amd.cdna4.buffer_store(stored_value, ptr=O, offsets=offs_o)
     # store lse
     offs_o1 = cur_batch * stride_o_b + cur_head_o * stride_o_h + split_kv_id * stride_o_s + HEAD_DIM_CKV
     lse = e_max + gl.log(e_sum)
-    gl.amd.cdna4.buffer_store(lse.to(dtype), ptr=O, offsets=offs_o1)
+    if NHEAD < BLOCK_H:
+        gl.amd.cdna4.buffer_store(lse.to(dtype), ptr=O, offsets=offs_o1, mask=(cur_head_o < NHEAD))
+    else:
+        gl.amd.cdna4.buffer_store(lse.to(dtype), ptr=O, offsets=offs_o1)
 # fmt: on
 
 # fmt: off
@@ -584,7 +592,11 @@ def mla_decode_gluon(
     assert (
         head_dim_kpe == 64
     ), f"mla_decode_gluon requires head_dim_kpe=64, got {head_dim_kpe}"
-    assert nhead == 16, f"mla_decode_gluon requires nhead=16, got {nhead}"
+    assert nhead in (
+        4,
+        8,
+        16,
+    ), f"mla_decode_gluon requires nhead in (4, 8, 16), got {nhead}"
 
     # buffer_load uses scalar base + 32-bit offsets, limiting addressable range.
     # For KV caches > 2 GB the kernel falls back to global_load (64-bit pointers).
@@ -638,6 +650,7 @@ def mla_decode_gluon(
         KV_PE_OFFSET=kv_pe_offset,
         USE_2D_VIEW=use_2d_view,
         WITHIN_2GB=within_2gb,
+        NHEAD=nhead,
     )
     grid_reduce = (batch_size, nhead)
     all_splits_nonempty = min_kv_seq_len > (NUM_KV_SPLITS - 1) ** 2

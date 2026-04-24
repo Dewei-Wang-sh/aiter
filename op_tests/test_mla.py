@@ -710,7 +710,7 @@ def test_mla(
         get_gfx() == "gfx950"
         and dtype == torch.bfloat16
         and kvtype == dtypes.fp8
-        and nhead == 16
+        and nhead in (4, 8, 16)
         and decode_qlen == 1
         and batch_size == 1
         and v_head_dim == 512
@@ -853,10 +853,20 @@ parser.add_argument(
     "-n",
     "--nhead",
     type=dtypes.str2tuple,
-    choices=[(4, 1), (16, 1), (16, 2), (16, 4), (64, 1), (128, 1), (128, 2), (128, 4)],
+    choices=[
+        (4, 1),
+        (8, 1),
+        (16, 1),
+        (16, 2),
+        (16, 4),
+        (64, 1),
+        (128, 1),
+        (128, 2),
+        (128, 4),
+    ],
     nargs="*",
     const=None,
-    default=[(4, 1), (16, 1), (16, 2), (16, 4), (128, 1), (128, 2)],
+    default=[(4, 1), (8, 1), (16, 1), (16, 2), (16, 4), (128, 1), (128, 2)],
     help="""Number of nhead and decode_qlen.
     e.g.: -n 16,1""",
 )
